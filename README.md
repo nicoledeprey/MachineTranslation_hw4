@@ -34,11 +34,10 @@ Running seq2seq.py
 
 
 # Algorithms
-
-1. Long Short-Term Memory (LSTM)  
+## Long Short-Term Memory (LSTM)  
 LSTM can be used to solve problems faced by the RNN model, such as, long term dependency problems and the vanishing and exploding gradient. LSTM makes use of three gates: forget gate, f, input gate, i, and output gate, o. LSTM also makes use of a cell state and candidate cell state to find the final output. A description of the LSTM Algorithm can be found in the MathDescription.pdf.
 
-2. Attention Visualization  
+## Attention Visualization  
 Attention is used to focus on different parts of the input at different steps. The attention mechanism computes attention scores for each element of the input sequence, indicating its relevance to the current decoding step. The attention scores are then normalized to create a probability distribution. A description of the attention decoder can be found in the MathDescription.pdf.
 
 # Results
