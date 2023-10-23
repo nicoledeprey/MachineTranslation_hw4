@@ -59,7 +59,7 @@ Running seq2seq.py
 # Algorithms
 ## Long Short-Term Memory (LSTM)  
 LSTM can be used to solve problems faced by the RNN model, such as, long term dependency problems and the vanishing and exploding gradient. LSTM makes use of three gates: forget gate, f, input gate, i, and output gate, o. LSTM also makes use of a cell state and candidate cell state to find the final output. A description of the LSTM Algorithm can be found in the MathDescription.pdf.
-$ f~t~ = g(Wfxt + Ufht-1 + bf) $
+$$ f~t = g(Wfxt + Ufht-1 + bf) $$
 it = g(Wixt + Uiht-1 + bi)
 ot = g(Woxt + Uoht-1 + bo)
 ft  represents forget gate
