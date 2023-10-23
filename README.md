@@ -41,7 +41,7 @@ LSTM can be used to solve problems faced by the RNN model, such as, long term de
 Attention is used to focus on different parts of the input at different steps. The attention mechanism computes attention scores for each element of the input sequence, indicating its relevance to the current decoding step. The attention scores are then normalized to create a probability distribution. A description of the attention decoder can be found in the MathDescription.pdf.
 
 # Results
-The code results should produce a BLEU Score of XXX.
+The code results should produce a BLEU Score of 0.4617316003241794.
 
 # Contributors
 This code was developed by Janvi Prasad, Nicole Deprey, and Hirtika Mirghani.
