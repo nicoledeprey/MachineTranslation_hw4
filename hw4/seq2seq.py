@@ -1,214 +1,171 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-This code is based on the tutorial by Sean Robertson <https://github.com/spro/practical-pytorch> found here:
-https://pytorch.org/tutorials/intermediate/seq2seq_translation_tutorial.html
-
-Students *MAY NOT* view the above tutorial or use it as a reference in any way. 
-"""
-
-
-from __future__ import unicode_literals, print_function, division
-
 import argparse
-import logging
-import random
 import time
-from io import open
-
-import matplotlib
-#if you are running on the gradx/ugradx/ another cluster, 
-#you will need the following line
-#if you run on a local machine, you can comment it out
-matplotlib.use('agg') 
-import matplotlib.pyplot as plt
-import matplotlib.ticker as ticker
+import logging
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from io import open
 from nltk.translate.bleu_score import corpus_bleu
+import matplotlib
+import matplotlib.pyplot as plt
+import matplotlib.ticker as ticker
+import numpy as np
+import random
 from torch import optim
 
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s - %(levelname)s - %(message)s')
 
-logging.basicConfig(level=logging.DEBUG,
-                    format='%(asctime)s %(levelname)s %(message)s')
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# we are forcing the use of cpu, if you have access to a gpu, you can set the flag to "cuda"
-# make sure you are very careful if you are using a gpu on a shared cluster/grid, 
-# it can be very easy to confict with other people's jobs.
-# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-device = torch.device("cpu")
+START_SYMBOL = "<START>"
+END_SYMBOL = "<END>"
+START_INDEX = 0
+END_INDEX = 1
+SEQ_MAX_LEN = 15
 
-SOS_token = "<SOS>"
-EOS_token = "<EOS>"
+class Vocabulary:
+    def __init__(self, language):
+        self.language = language
+        self.word_to_index = {START_SYMBOL: START_INDEX, END_SYMBOL: END_INDEX}
+        self.word_freq = {}
+        self.index_to_word = {START_INDEX: START_SYMBOL, END_INDEX: END_SYMBOL}
+        self.total_words = 2
 
-SOS_index = 0
-EOS_index = 1
-MAX_LENGTH = 15
-
-
-class Vocab:
-    """ This class handles the mapping between the words and their indicies
-    """
-    def __init__(self, lang_code):
-        self.lang_code = lang_code
-        self.word2index = {}
-        self.word2count = {}
-        self.index2word = {SOS_index: SOS_token, EOS_index: EOS_token}
-        self.n_words = 2  # Count SOS and EOS
-
-    def add_sentence(self, sentence):
-        for word in sentence.split(' '):
+    def add_line(self, line):
+        for word in line.split():
             self._add_word(word)
 
     def _add_word(self, word):
-        if word not in self.word2index:
-            self.word2index[word] = self.n_words
-            self.word2count[word] = 1
-            self.index2word[self.n_words] = word
-            self.n_words += 1
+        if word in self.word_to_index:
+            self.word_freq[word] += 1
         else:
-            self.word2count[word] += 1
+            self.word_to_index[word] = self.total_words
+            self.word_freq[word] = 1
+            self.index_to_word[self.total_words] = word
+            self.total_words += 1
 
+def read_data(file_path):
+    with open(file_path, encoding='utf-8') as f:
+        lines = f.read().strip().split('\n')
+    sentence_pairs = [line.split('|||') for line in lines]
+    return sentence_pairs
 
-######################################################################
+def generate_vocabs(src_lang, tgt_lang, data_file):
+    src_vocab = Vocabulary(src_lang)
+    tgt_vocab = Vocabulary(tgt_lang)
+    sentence_pairs = read_data(data_file)
+    for src, tgt in sentence_pairs:
+        src_vocab.add_line(src)
+        tgt_vocab.add_line(tgt)
 
-
-def split_lines(input_file):
-    """split a file like:
-    first src sentence|||first tgt sentence
-    second src sentence|||second tgt sentence
-    into a list of things like
-    [("first src sentence", "first tgt sentence"), 
-     ("second src sentence", "second tgt sentence")]
-    """
-    logging.info("Reading lines of %s...", input_file)
-    # Read the file and split into lines
-    lines = open(input_file, encoding='utf-8').read().strip().split('\n')
-    # Split every line into pairs
-    pairs = [l.split('|||') for l in lines]
-    return pairs
-
-
-def make_vocabs(src_lang_code, tgt_lang_code, train_file):
-    """ Creates the vocabs for each of the langues based on the training corpus.
-    """
-    src_vocab = Vocab(src_lang_code)
-    tgt_vocab = Vocab(tgt_lang_code)
-
-    train_pairs = split_lines(train_file)
-
-    for pair in train_pairs:
-        src_vocab.add_sentence(pair[0])
-        tgt_vocab.add_sentence(pair[1])
-
-    logging.info('%s (src) vocab size: %s', src_vocab.lang_code, src_vocab.n_words)
-    logging.info('%s (tgt) vocab size: %s', tgt_vocab.lang_code, tgt_vocab.n_words)
+    logging.info('Vocab size for %s: %d', src_vocab.language, src_vocab.total_words)
+    logging.info('Vocab size for %s: %d', tgt_vocab.language, tgt_vocab.total_words)
 
     return src_vocab, tgt_vocab
 
-######################################################################
+def convert_to_tensor(vocab, line):
+    indices = [vocab.word_to_index.get(word, END_INDEX) for word in line.split()]
+    indices.append(END_INDEX)
+    return torch.tensor(indices, dtype=torch.long, device=device).view(-1, 1)
 
-def tensor_from_sentence(vocab, sentence):
-    """creates a tensor from a raw sentence
-    """
-    indexes = []
-    for word in sentence.split():
-        try:
-            indexes.append(vocab.word2index[word])
-        except KeyError:
-            pass
-            # logging.warn('skipping unknown subword %s. Joint BPE can produces subwords at test time which are not in vocab. As long as this doesnt happen every sentence, this is fine.', word)
-    indexes.append(EOS_index)
-    return torch.tensor(indexes, dtype=torch.long, device=device).view(-1, 1)
+def pair_to_tensors(src_vocab, tgt_vocab, pair):
+    src_tensor = convert_to_tensor(src_vocab, pair[0])
+    tgt_tensor = convert_to_tensor(tgt_vocab, pair[1])
+    return src_tensor, tgt_tensor
 
+class SimpleLSTM(nn.Module):
+    # ... [rest of the SimpleLSTM code]
+    def __init__(self, input_size, hidden_size, bias=True):
+        super(SimpleLSTM, self).__init__()
+        
+        # input gate
+        self.wx_input = nn.Linear(input_size, hidden_size, bias=bias)
+        self.wh_input = nn.Linear(hidden_size, hidden_size, bias=bias)
+        
+        # forget gate
+        self.wx_forget = nn.Linear(input_size, hidden_size, bias=bias)
+        self.wh_forget = nn.Linear(hidden_size, hidden_size, bias=bias)
 
-def tensors_from_pair(src_vocab, tgt_vocab, pair):
-    """creates a tensor from a raw sentence pair
-    """
-    input_tensor = tensor_from_sentence(src_vocab, pair[0])
-    target_tensor = tensor_from_sentence(tgt_vocab, pair[1])
-    return input_tensor, target_tensor
+        # output gate 
+        self.wx_output = nn.Linear(input_size, hidden_size, bias=bias)
+        self.wh_output = nn.Linear(hidden_size, hidden_size, bias=bias)
 
+        # context gate 
+        self.wx_context = nn.Linear(input_size, hidden_size, bias=bias)
+        self.wh_context = nn.Linear(hidden_size, hidden_size, bias=bias)
 
-######################################################################
+        #utilities
+        self.sigmoid = nn.Sigmoid()
+        self.tanh = nn.Tanh()
 
+    def forward(self, input, hidden):
+        
+        h_t, c_prev = hidden
 
-class EncoderRNN(nn.Module):
-    """the class for the enoder RNN
-    """
+        i_t = self.sigmoid(self.wx_input(input) + self.wh_input(h_t))
+        f_t = self.sigmoid(self.wx_forget(input) + self.wh_forget(h_t))
+        o_t = self.sigmoid(self.wx_output(input) + self.wh_output(h_t))
+        
+        c_t = self.tanh(self.wx_context(input) + self.wh_context(h_t)) #tilde c_t 
+        c_t = f_t * c_prev + i_t * c_t
+        
+        h_t = o_t * self.tanh(c_t)
+
+        return h_t, c_t
+
+    
+
+class SeqEncoder(nn.Module):
+    # ... [rest of the SeqEncoder code]
     def __init__(self, input_size, hidden_size):
-        super(EncoderRNN, self).__init__()
+        super(SeqEncoder, self).__init__()
         self.hidden_size = hidden_size
         """Initilize a word embedding and bi-directional LSTM encoder
-        For this assignment, you should *NOT* use nn.LSTM. 
+        For this assignment, you should NOT use nn.LSTM. 
         Instead, you should implement the equations yourself.
         See, for example, https://en.wikipedia.org/wiki/Long_short-term_memory#LSTM_with_a_forget_gate
         You should make your LSTM modular and re-use it in the Decoder.
         """
-        "*** YOUR CODE HERE ***"
-        self.embedding = nn.Embedding(input_size, hidden_size)
-        # Define the weight matrices for RNN
-        self.W_ih = nn.Parameter(torch.randn(hidden_size, hidden_size))
-        self.W_hh = nn.Parameter(torch.randn(hidden_size, hidden_size))
-        self.b_ih = nn.Parameter(torch.randn(hidden_size))
-        self.b_hh = nn.Parameter(torch.randn(hidden_size))
-
-        #raise NotImplementedError
-        #return output, hidden
+        "* YOUR CODE HERE *"
+        self.emb = nn.Embedding(input_size, hidden_size) 
+        self.lstm = SimpleLSTM(hidden_size, hidden_size)       
+        
 
 
     def forward(self, input, hidden):
         """runs the forward pass of the encoder
         returns the output and the hidden state
         """
-        "*** YOUR CODE HERE ***"
-        embedded = self.embedding(input).view(1, 1, -1)
-        combined = torch.cat((embedded, hidden), 2)
-        # RNN update rule
-        hidden = torch.tanh(
-            torch.mm(embedded.squeeze(0), self.W_ih.T) + self.b_ih +
-            torch.mm(hidden.squeeze(0), self.W_hh.T) + self.b_hh
-        ).unsqueeze(0)
-        return hidden, hidden
-    
-        #raise NotImplementedError
-        #return output, hidden
+        "* YOUR CODE HERE *"
+        
+        
+        x = self.emb(input)
+        h_t, c_t = self.lstm(x, hidden)
+        return h_t, (h_t, c_t)
 
     def get_initial_hidden_state(self):
         return torch.zeros(1, 1, self.hidden_size, device=device)
 
-
-class AttnDecoderRNN(nn.Module):
-    """the class for the decoder 
-    """
-    def __init__(self, hidden_size, output_size, dropout_p=0.1, max_length=MAX_LENGTH):
-        super(AttnDecoderRNN, self).__init__()
+class AttnSeqDecoder(nn.Module):
+    # ... [rest of the AttnSeqDecoder code]
+    def __init__(self, hidden_size, output_size, dropout_p=0.1, max_length=SEQ_MAX_LEN):
+        super(AttnSeqDecoder, self).__init__()
         self.hidden_size = hidden_size
         self.output_size = output_size
         self.dropout_p = dropout_p
         self.max_length = max_length
-
-        self.dropout = nn.Dropout(self.dropout_p)
         
-        """Initilize your word embedding, decoder LSTM, and weights needed for your attention here
+        self.emb = nn.Embedding(output_size, hidden_size)
+        self.lstm = SimpleLSTM(hidden_size, hidden_size)
+        self.dropout = nn.Dropout(self.dropout_p)
+        self.w_query = nn.Linear(hidden_size, hidden_size)
+        self.w_key = nn.Linear(hidden_size, hidden_size)
+        self.w_value = nn.Linear(hidden_size, hidden_size)
+        self.tanh = nn.Tanh()
         """
-        "*** YOUR CODE HERE ***"
-        self.embedding = nn.Embedding(self.output_size, self.hidden_size)
-        self.attn = nn.Linear(self.hidden_size * 2, self.max_length)
-        self.attn_combine = nn.Linear(self.hidden_size * 2, self.hidden_size)
-        self.dropout = nn.Dropout(0.1)
-        # Define the weight matrices for RNN
-        self.W_ih = nn.Parameter(torch.randn(hidden_size, hidden_size))
-        self.W_hh = nn.Parameter(torch.randn(hidden_size, hidden_size))
-        self.b_ih = nn.Parameter(torch.randn(hidden_size))
-        self.b_hh = nn.Parameter(torch.randn(hidden_size))
+        Initilize your word embedding, decoder LSTM, and weights needed for your attention here
+        """
         self.out = nn.Linear(self.hidden_size, self.output_size)
-
-        #raise NotImplementedError
-
-        #self.out = nn.Linear(self.hidden_size, self.output_size)
 
     def forward(self, input, hidden, encoder_outputs):
         """runs the forward pass of the decoder
@@ -217,87 +174,81 @@ class AttnDecoderRNN(nn.Module):
         Dropout (self.dropout) should be applied to the word embeddings.
         """
         
-        "*** YOUR CODE HERE ***"
+        "* YOUR CODE HERE *"
+        x = self.emb(input)
+        #x = torch.nn.functional.relu(x)
+        x = self.dropout(x)
+        h_t, _ = hidden #h_t is the decoder hidden state
+        
+        # (scaled) dot product attention
+        if len(encoder_outputs.shape) == 2:
+            encoder_outputs = torch.unsqueeze(encoder_outputs, 0)
 
-        embedded = self.embedding(input).view(1, 1, -1)
-        embedded = self.dropout(embedded)
-
-        attn_weights = F.softmax(
-            self.attn(torch.cat((embedded[0], hidden[0]), 1)), dim=1)
-        attn_applied = torch.bmm(attn_weights.unsqueeze(0),
-                                 encoder_outputs.unsqueeze(0))
-
-        output = torch.cat((embedded[0], attn_applied[0]), 1)
-        output = self.attn_combine(output).unsqueeze(0)
-
-        # RNN update rule for decoder
-        output = torch.tanh(
-            torch.mm(output.squeeze(0), self.W_ih.T) + self.b_ih +
-            torch.mm(hidden.squeeze(0), self.W_hh.T) + self.b_hh
-        ).unsqueeze(0)
-
-        output = F.log_softmax(self.out(output[0]), dim=1)
-        return output, hidden, attn_weights
-        #raise NotImplementedError
-        #return log_softmax, hidden, attn_weights
+        query = self.w_query(h_t) #b, 1, n
+        key, value = self.w_key(encoder_outputs), self.w_value(encoder_outputs) #b, length, n
+        #print(f"key.shape = {key.shape}")
+        
+        attn_weights = torch.matmul(query, torch.transpose(key, 1, 2))
+        # q^{\top}k should be b, 1, length
+        # attn_weights = torch.div(attn_weights, math.sqrt(self.hidden_size))
+        attn_weights = torch.softmax(attn_weights, dim=-1)
+        # context vector c_t = sum of dot product of attn_weights and encoder_outputs
+        # attn_weight shape (1, length), encoder_outputs shape (length, hidden_size)
+        for i in range(attn_weights.shape[2]):
+            if i == 0:
+                c_t = attn_weights[:, :, i]*encoder_outputs[:, i, :]
+            else:
+                c_t = c_t + attn_weights[:, :, i]*encoder_outputs[:, i, :]
+        
+        hidden = (h_t, c_t)
+        h_t, c_t = self.lstm(x, hidden)
+        output = h_t
+        hidden = (h_t, c_t)
+        output = self.out(output)
+        
+        log_softmax = torch.log(torch.softmax(output, dim=-1))
+        return log_softmax, hidden, attn_weights
 
     def get_initial_hidden_state(self):
         return torch.zeros(1, 1, self.hidden_size, device=device)
 
-
-######################################################################
-
-def train(input_tensor, target_tensor, encoder, decoder, optimizer, criterion, max_length=MAX_LENGTH):
-    encoder_hidden = encoder.get_initial_hidden_state()
+def run_training(input_tensor, target_tensor, encoder, decoder, opt, loss_func, max_len=SEQ_MAX_LEN):
+    # ... [rest of the run_training code]
+    encoder_hidden = (encoder.get_initial_hidden_state(), encoder.get_initial_hidden_state())
 
     # make sure the encoder and decoder are in training mode so dropout is applied
     encoder.train()
     decoder.train()
 
-    "*** YOUR CODE HERE ***"
-    optimizer.zero_grad()
-
-    input_length = input_tensor.size(0)
-    target_length = target_tensor.size(0)
-
-    encoder_outputs = torch.zeros(max_length, encoder.hidden_size, device=device)
-
-    loss = 0
-
-    # Pass through the encoder
-    for ei in range(input_length):
-        encoder_output, encoder_hidden = encoder(input_tensor[ei], encoder_hidden)
-        encoder_outputs[ei] = encoder_output[0, 0]
-
-    # Prepare the input and initial decoder hidden state
-    decoder_input = torch.tensor([[SOS_index]], device=device)
+    opt.zero_grad()
+    "* YOUR CODE HERE *"
+    loss = 0.0
+    for i in range(input_tensor.shape[0]):
+        output, encoder_hidden = encoder(input_tensor[i], encoder_hidden)
+        # shape of output = batch, 1, hidden_size
+        if i == 0:
+            encoder_outputs = output
+        else:
+            encoder_outputs = torch.cat([encoder_outputs, output], dim=1)
+    
+    
     decoder_hidden = encoder_hidden
-
-    # Pass through the decoder
-    for di in range(target_length):
-        decoder_output, decoder_hidden, decoder_attention = decoder(
-            decoder_input, decoder_hidden, encoder_outputs)
-        topv, topi = decoder_output.topk(1)
-        decoder_input = topi.squeeze().detach()  # detach from history as input
-
-        loss += criterion(decoder_output, target_tensor[di])
-        if decoder_input.item() == EOS_token:
-            break
-
+    decoder_input = torch.tensor([[0]], device=device)
+    for i in range(target_tensor.shape[0]):
+        logits, decoder_hidden, attn_weights = decoder(decoder_input, decoder_hidden, encoder_outputs)
+        logits = torch.squeeze(logits, 0) 
+        #B, 1, vocab_size
+        loss += loss_func(logits, target_tensor[i])
+        decoder_input = target_tensor[i]
+    
     loss.backward()
-    optimizer.step()
+    opt.step()
+    
+    return loss.item() 
 
-    return loss.item() / target_length
+# Rest of the code...
 
-    #raise NotImplementedError
-
-    #return loss.item() 
-
-
-
-######################################################################
-
-def translate(encoder, decoder, sentence, src_vocab, tgt_vocab, max_length=MAX_LENGTH):
+def translate(encoder, decoder, sentence, src_vocab, tgt_vocab, max_length=SEQ_MAX_LEN):
     """
     runs tranlsation, returns the output and attention
     """
@@ -307,9 +258,9 @@ def translate(encoder, decoder, sentence, src_vocab, tgt_vocab, max_length=MAX_L
     decoder.eval()
 
     with torch.no_grad():
-        input_tensor = tensor_from_sentence(src_vocab, sentence)
+        input_tensor = convert_to_tensor(src_vocab, sentence)
         input_length = input_tensor.size()[0]
-        encoder_hidden = encoder.get_initial_hidden_state()
+        encoder_hidden = (encoder.get_initial_hidden_state(), encoder.get_initial_hidden_state())
 
         encoder_outputs = torch.zeros(max_length, encoder.hidden_size, device=device)
 
@@ -318,7 +269,7 @@ def translate(encoder, decoder, sentence, src_vocab, tgt_vocab, max_length=MAX_L
                                                      encoder_hidden)
             encoder_outputs[ei] += encoder_output[0, 0]
 
-        decoder_input = torch.tensor([[SOS_index]], device=device)
+        decoder_input = torch.tensor([[START_INDEX]], device=device)
 
         decoder_hidden = encoder_hidden
 
@@ -330,11 +281,11 @@ def translate(encoder, decoder, sentence, src_vocab, tgt_vocab, max_length=MAX_L
                 decoder_input, decoder_hidden, encoder_outputs)
             decoder_attentions[di] = decoder_attention.data
             topv, topi = decoder_output.data.topk(1)
-            if topi.item() == EOS_index:
-                decoded_words.append(EOS_token)
+            if topi.item() == END_INDEX:
+                decoded_words.append(END_SYMBOL)
                 break
             else:
-                decoded_words.append(tgt_vocab.index2word[topi.item()])
+                decoded_words.append(tgt_vocab.index_to_word[topi.item()])
 
             decoder_input = topi.squeeze().detach()
 
@@ -344,7 +295,7 @@ def translate(encoder, decoder, sentence, src_vocab, tgt_vocab, max_length=MAX_L
 ######################################################################
 
 # Translate (dev/test)set takes in a list of sentences and writes out their transaltes
-def translate_sentences(encoder, decoder, pairs, src_vocab, tgt_vocab, max_num_sentences=None, max_length=MAX_LENGTH):
+def translate_sentences(encoder, decoder, pairs, src_vocab, tgt_vocab, max_num_sentences=None, max_length=SEQ_MAX_LEN):
     output_sentences = []
     for pair in pairs[:max_num_sentences]:
         output_words, attentions = translate(encoder, decoder, pair[0], src_vocab, tgt_vocab)
@@ -377,45 +328,26 @@ def show_attention(input_sentence, output_words, attentions):
     You plots should include axis labels and a legend.
     you may want to use matplotlib.
     """
-    
-    "*** YOUR CODE HERE ***"
-
-    """
-    Visualize the attention mechanism.
-    :param input_sentence: List of words from the input sentence
-    :param output_words: List of words from the output
-    :param attentions: Attention weights for visualizing (numpy array or PyTorch tensor)
-    """
-    # Convert from tensor if given
-    if hasattr(attentions, 'cpu'):
-        attentions = attentions.cpu().detach().numpy()
-
-    # Set up figure with colorbar
+    #TODO
+    att=torch.transpose(attentions,0,1)
+    input_words = input_sentence.strip().split()
     fig, ax = plt.subplots()
-    cax = ax.matshow(attentions, cmap='bone')
-    fig.colorbar(cax)
-
-    # Set up axes
-    ax.set_xticklabels([''] + input_sentence.split(' ') + ['<EOS>'], rotation=90)
-    ax.set_yticklabels([''] + output_words)
-
-    # Show label at every tick
-    ax.xaxis.set_major_locator(ticker.MultipleLocator(1))
-    ax.yaxis.set_major_locator(ticker.MultipleLocator(1))
-
-    # Save the figure
-    plt.savefig('attention_plot.png')
+    ax.pcolor(att, cmap=plt.cm.Greys)
+    ax.set_xticks(np.arange(attentions.shape[0]) + 0.5, minor=False)
+    ax.set_yticks(np.arange(len(input_words)) + 0.5, minor=False)
+    ax.set_xlim(0, int(attentions.shape[0]))
+    ax.set_ylim(0, int(len(input_words)))
+    ax.invert_yaxis()
+    ax.xaxis.tick_top()
+    ax.set_xticklabels(output_words, minor=False)
+    ax.set_yticklabels(input_words, minor=False)
+    plt.xticks(rotation=90)
+    plt.tight_layout()
     plt.show()
 
-    #raise NotImplementedError
-
-
-def translate_and_show_attention(input_sentence, encoder1, decoder1, src_vocab, tgt_vocab):
-    output_words, attentions = translate(
-        encoder1, decoder1, input_sentence, src_vocab, tgt_vocab)
-    print('input =', input_sentence)
-    print('output =', ' '.join(output_words))
-    show_attention(input_sentence, output_words, attentions)
+    # Saving the plot to a file
+    index = len(input_sentence) 
+    plt.savefig(f'heatmap_{index}.png')
 
 
 def clean(strx):
@@ -423,7 +355,7 @@ def clean(strx):
     input: string with bpe, EOS
     output: list without bpe, EOS
     """
-    return ' '.join(strx.replace('@@ ', '').replace(EOS_token, '').strip().split())
+    return ' '.join(strx.replace('@@ ', '').replace(END_SYMBOL, '').strip().split())
 
 
 ######################################################################
@@ -432,9 +364,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--hidden_size', default=256, type=int,
                     help='hidden size of encoder/decoder, also word vector size')
-    ap.add_argument('--n_iters', default=100000, type=int,
+    ap.add_argument('--n_iters', default=200000, type=int,
                     help='total number of examples to train on')
-    ap.add_argument('--print_every', default=5000, type=int,
+    ap.add_argument('--print_every', default=500, type=int,
                     help='print loss info every this many training examples')
     ap.add_argument('--checkpoint_every', default=10000, type=int,
                     help='write out checkpoint every this many training examples')
@@ -472,12 +404,13 @@ def main():
         tgt_vocab = state['tgt_vocab']
     else:
         iter_num = 0
-        src_vocab, tgt_vocab = make_vocabs(args.src_lang,
+        src_vocab, tgt_vocab = generate_vocabs(args.src_lang,
                                            args.tgt_lang,
                                            args.train_file)
 
-    encoder = EncoderRNN(src_vocab.n_words, args.hidden_size).to(device)
-    decoder = AttnDecoderRNN(args.hidden_size, tgt_vocab.n_words, dropout_p=0.1).to(device)
+    print(f"tgt_vocab.total_words = {tgt_vocab.total_words}")
+    encoder = SeqEncoder(src_vocab.total_words, args.hidden_size).to(device)
+    decoder = AttnSeqDecoder(args.hidden_size, tgt_vocab.total_words, dropout_p=0.1).to(device)
 
     # encoder/decoder weights are randomly initilized
     # if checkpointed, load saved weights
@@ -486,9 +419,9 @@ def main():
         decoder.load_state_dict(state['dec_state'])
 
     # read in datafiles
-    train_pairs = split_lines(args.train_file)
-    dev_pairs = split_lines(args.dev_file)
-    test_pairs = split_lines(args.test_file)
+    train_pairs = read_data(args.train_file)
+    dev_pairs = read_data(args.dev_file)
+    test_pairs = read_data(args.test_file)
 
     # set up optimization/loss
     params = list(encoder.parameters()) + list(decoder.parameters())  # .parameters() returns generator
@@ -505,10 +438,12 @@ def main():
 
     while iter_num < args.n_iters:
         iter_num += 1
-        training_pair = tensors_from_pair(src_vocab, tgt_vocab, random.choice(train_pairs))
+        if iter_num % 100 == 0:
+            print(f"now at iter {iter_num}")
+        training_pair = pair_to_tensors(src_vocab, tgt_vocab, random.choice(train_pairs))
         input_tensor = training_pair[0]
         target_tensor = training_pair[1]
-        loss = train(input_tensor, target_tensor, encoder,
+        loss = run_training(input_tensor, target_tensor, encoder,
                      decoder, optimizer, criterion)
         print_loss_total += loss
 
@@ -540,19 +475,21 @@ def main():
             candidates = [clean(sent).split() for sent in translated_sentences]
             dev_bleu = corpus_bleu(references, candidates)
             logging.info('Dev BLEU score: %.2f', dev_bleu)
-
+    
+    print("Translating the test set")
     # translate test set and write to file
     translated_sentences = translate_sentences(encoder, decoder, test_pairs, src_vocab, tgt_vocab)
     with open(args.out_file, 'wt', encoding='utf-8') as outf:
         for sent in translated_sentences:
             outf.write(clean(sent) + '\n')
-
+    
+    print("Visualizing the attention")
     # Visualizing Attention
-    translate_and_show_attention("on p@@ eu@@ t me faire confiance .", encoder, decoder, src_vocab, tgt_vocab)
-    translate_and_show_attention("j en suis contente .", encoder, decoder, src_vocab, tgt_vocab)
-    translate_and_show_attention("vous etes tres genti@@ ls .", encoder, decoder, src_vocab, tgt_vocab)
-    translate_and_show_attention("c est mon hero@@ s ", encoder, decoder, src_vocab, tgt_vocab)
-
+    # translate_and_show_attention("on p@@ eu@@ t me faire confiance .", encoder, decoder, src_vocab, tgt_vocab)
+    # translate_and_show_attention("j en suis contente .", encoder, decoder, src_vocab, tgt_vocab)
+    # translate_and_show_attention("vous etes tres genti@@ ls .", encoder, decoder, src_vocab, tgt_vocab)
+    # translate_and_show_attention("c est mon hero@@ s ", encoder, decoder, src_vocab, tgt_vocab)
+    
 
 if __name__ == '__main__':
     main()
