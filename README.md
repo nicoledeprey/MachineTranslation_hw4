@@ -12,7 +12,7 @@ This code implements a Long Short-Term Memory RNN encoder and decoder with atten
 
 
 # Main Components
-# Vocab Class
+## Vocab Class
 A class that handles the mapping between words and their indices. It provides methods to convert sentences into numerical representations suitable for modeling.
 Data Preparation
 The provided functions allow users to:
@@ -20,13 +20,13 @@ Split lines from a file into pairs of sentences.
 Create vocabularies based on the training corpus.
 Convert sentences into tensors that can be fed into the models.
 
-# MyLSTM Class
+## MyLSTM Class
 An implementation of the LSTM cell. The class encapsulates the inner workings of the LSTM unit, defining the input, forget, output, and context gates.
 
-# EncoderRNN Class
+## EncoderRNN Class
 The encoder takes in a sequence of embeddings and returns the final hidden state which is then used by the decoder. The encoder is implemented using the aforementioned LSTM cell.
 
-# AttnDecoderRNN Class
+## AttnDecoderRNN Class
 The decoder, augmented with an attention mechanism. It computes attention weights for each time step based on the encoder's output and the decoder's previous state, enabling the model to focus on different parts of the input sequence at each decoding step.
 Training Function
 This function accepts an input tensor (source sentence) and a target tensor (target sentence), and updates the model's weights using backpropagation.
